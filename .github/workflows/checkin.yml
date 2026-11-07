@@ -12,9 +12,15 @@ name: WorkBuddy 每日自动签到
 
 on:
   schedule:
-    # GitHub Actions 使用 UTC 时间；北京时间 09:00 = UTC 01:00
-    # ⚠️ 定时任务在整点前后可能有数分钟~数十分钟延迟，属 GitHub 正常现象
-    - cron: '0 1 * * *'
+    # GitHub Actions 使用 UTC 时间。每天多个时点兜底：脚本幂等，
+    # 今天已签到会返回 skip_already_signed 自动跳过，绝不会重复领取。
+    # 实测定时可能延迟数小时（2026-11-07 曾延迟约 5 小时 48 分），
+    # 所以首个时点提前到北京时间 06:00，之后每 4 小时再试一次，
+    # 保证「当天至少成功一次」，而不是赌某一个准点。
+    - cron: '0 22 * * *'   # 北京时间 06:00（UTC 前一天 22:00）
+    - cron: '0 2 * * *'    # 北京时间 10:00
+    - cron: '0 6 * * *'    # 北京时间 14:00
+    - cron: '0 10 * * *'   # 北京时间 18:00
   # 支持在 Actions 页面手动触发（首次配置后建议先手动跑一次验证）
   workflow_dispatch:
     inputs:
@@ -100,6 +106,23 @@ jobs:
           echo "checkin_exit_code=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
 
+      - name: 处理其他积分任务
+        id: rewards
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.check_only }}" = "true" ]; then
+            ARGS="--dry-run"
+          fi
+          set +e
+          python scripts/daily_rewards.py $ARGS | tee rewards.json
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "rewards_exit_code=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: 输出其他任务摘要
+        if: always()
+        run: python scripts/summarize_rewards.py rewards.json >> "$GITHUB_STEP_SUMMARY"
+
       - name: 输出运行摘要
         if: always()
         # 只输出白名单字段，不把完整 result.json 写入摘要
@@ -108,7 +131,7 @@ jobs:
           python scripts/summarize_result.py result.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: 失败时终止任务（触发 GitHub 失败通知）
-        if: steps.checkin.outcome != 'success'
+        if: steps.checkin.outcome != 'success' || steps.rewards.outcome != 'success' || steps.rewards.outputs.rewards_exit_code != '0'
         run: |
-          echo "::error::签到未成功（退出码 ${{ steps.checkin.outputs.checkin_exit_code }}），请查看上方日志与运行摘要"
+          echo "::error::签到退出码 ${{ steps.checkin.outputs.checkin_exit_code }}；其他任务退出码 ${{ steps.rewards.outputs.rewards_exit_code }}。请查看日志与运行摘要"
           exit 1
